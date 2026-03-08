@@ -9,11 +9,13 @@ from cutlass.cute.runtime import from_dlpack
 
 @cute.jit
 def show_layout_theory_jit():
-    m = 2
-    n = 1024
-    tile_m = 2
-    tile_n = 256
-    block_idx_x = 2
+    m = 2  # rows
+    n = 1024  # cols
+    tile_m = 2  # rows
+    tile_n = 256  # cols 
+    # tile_m, tile_n = (2, 256)
+    
+    tile_col_idx = 2
 
     # Start from a 2D row-major layout that matches the real tensor demo:
     #
@@ -53,9 +55,9 @@ def show_layout_theory_jit():
 
     # Pick the third tile in the tile-column dimension: tile (0, 2).
     # This corresponds to columns [512:768).
-    blk_layout, blk_offset = cute.slice_and_offset(((None, None), (0, block_idx_x)), blocked)
-    print(f"Block (0, {block_idx_x}) layout: {blk_layout}")
-    print(f"Block (0, {block_idx_x}) base offset: {blk_offset}")
+    blk_layout, blk_offset = cute.slice_and_offset(((None, None), (0, tile_col_idx)), blocked)
+    print(f"Block (0, {tile_col_idx}) layout: {blk_layout}")
+    print(f"Block (0, {tile_col_idx}) base offset: {blk_offset}")
     # -> ((2,256)):((1024,1))
     # -> 512
     #
