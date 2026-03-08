@@ -14,16 +14,17 @@ def show_layout_theory_jit():
     tile_m = 2  # rows
     tile_n = 256  # cols 
     # tile_m, tile_n = (2, 256)
-    
+
     tile_col_idx = 2
 
     # Start from a 2D row-major layout that matches the real tensor demo:
     #
     #   logical shape  : (2, 1024)
-    #   physical stride: (1024, 1)
+    #   physical stride: (1024, 1)  # 1 is fastest moving dimension..cols
     #
     # So moving by +1 row jumps 1024 elements, while moving by +1 column
     # jumps 1 element.
+
     gmem = cute.make_layout((m, n), stride=(n, 1))
     print(f"Global layout: {gmem}")
     # -> (2,1024):(1024,1)
@@ -38,13 +39,13 @@ def show_layout_theory_jit():
     #   - one full tile in the row dimension
     #   - four tiles in the column dimension
     blocked = cute.zipped_divide(gmem, (tile_m, tile_n))
-    print(f"After block divide: {blocked}")
+    print(f"After zipped divide by tile (2,256): {blocked}")
     # -> ((2,256),(1,4)):((1024,1),(0,256))
     #
     # Read this as:
     #   first tuple  ((2,256), (1,4))
-    #     - (2,256) is the per-block tile shape
-    #     - (1,4)   tells us there are 1 x 4 such tiles in the full tensor
+    #     - (2,256) is the per-block tile shape  WITHIN TILE
+    #     - (1,4)   tells us there are 1 x 4 such tiles in the full tensor ... WHICH TILE
     #
     #   second tuple ((1024,1), (0,256))
     #     - (1024,1) is the stride inside one block tile
@@ -52,9 +53,24 @@ def show_layout_theory_jit():
     #         * moving to the next tile row changes nothing (0), because there
     #           is only one tile in the row dimension
     #         * moving to the next tile column jumps by 256 elements
+    #    The 1024 means:
+    #
+    #    if you stay in the same tile and move from row 0 to row 1, the linear offset increases by 1024
+    #    if you stay in the same row and move from column j to j+1, the linear offset increases by 1
+    
+    #  One tile is thus:
+    #  (2,256):(1024,1)  
 
-    # Pick the third tile in the tile-column dimension: tile (0, 2).
-    # This corresponds to columns [512:768).
+    # `blocked` has hierarchical coordinates:
+    #     WITHIN TILE                                        WHICH TILE
+    #   ((coord_inside_tile_row, coord_inside_tile_col), (which_tile_row, which_tile_col))
+    #
+    # So in `((None, None), (0, tile_col_idx))`:
+    #   - `(None, None)` means "keep all coordinates inside the chosen tile"
+    #   - `(0, tile_col_idx)` means "pick tile row 0 and tile column `tile_col_idx`"
+    #
+    # Since `tile_col_idx = 2`, this picks the 3rd tile across the columns,
+    # which corresponds to columns [512:768).
     blk_layout, blk_offset = cute.slice_and_offset(((None, None), (0, tile_col_idx)), blocked)
     print(f"Block (0, {tile_col_idx}) layout: {blk_layout}")
     print(f"Block (0, {tile_col_idx}) base offset: {blk_offset}")
@@ -81,6 +97,9 @@ def show_layout_theory_jit():
     # Read this as:
     #   - (1,256) is the work owned by one logical thread tile
     #   - (2,1) means there are 2 such thread tiles inside the block
+    #   - the first stride tuple (0,1) is the stride -- inside one thread tile --:
+    #       * moving along the thread-tile row does nothing because its extent is 1
+    #       * moving along the thread-tile columns advances by 1 element
     #   - the second tile stride (1024,0) shows how to move between
     #     thread tiles:
     #       * moving to the next thread-tile row jumps by 1024 elements
@@ -110,24 +129,63 @@ def tiled_elementwise_add_kernel(
     tidx, _, _ = cute.arch.thread_idx()
     bidx, _, _ = cute.arch.block_idx()
 
+    # `gA`, `gB`, and `gC` are already tiled by `zipped_divide(..., tiler_mn)` in
+    # the host JIT function. So their coordinate structure is:
+    #
+    #   ((coord_inside_tile_m, coord_inside_tile_n), which_tile)
+    #
+    # For this demo there are 4 tiles total across the N dimension, so `which_tile`
+    # is effectively the block index.
+    #
     # Slice out one thread-block tile from each tiled tensor.
     blk_coord = ((None, None), bidx)
     blkA = gA[blk_coord]
     blkB = gB[blk_coord]
     blkC = gC[blk_coord]
 
-    # Compose block-local tensors with the thread/value layout so that
-    # (thread_idx, value_idx) maps directly to a memory address.
+    # After this slice, each `blk*` is just the local tile owned by this block.
+    # In this example that tile has shape (2, 256), so conceptually:
+    #
+    #   blkA : (tile_row, tile_col) -> global-memory address
+    #
+    # The block no longer needs to mention "which tile" because `bidx` already
+    # selected it.
+
+    # `tv_layout` is the thread/value layout built on the host:
+    #
+    #   (thread_idx, value_idx) -> (tile_row, tile_col)
+    #
+    # `composition(blkA, tv_layout)` plugs that mapping into the block tile:
+    #
+    #   blkA     : (tile_row, tile_col) -> address
+    #   tv_layout: (thread_idx, value_idx) -> (tile_row, tile_col)
+    #   -----------------------------------------------------------
+    #   tidfrgA  : (thread_idx, value_idx) -> address
+    #
+    # So composition rewrites the block-local tensor in thread-centric terms.
+    # Instead of asking "which element of the tile is this?", we can ask
+    # "which value owned by which thread is this?"
     tidfrgA = cute.composition(blkA, tv_layout)
     tidfrgB = cute.composition(blkB, tv_layout)
     tidfrgC = cute.composition(blkC, tv_layout)
 
-    # Slice out the fragment owned by one thread.
+    # Now select one thread's fragment.
+    #
+    # `tidx` chooses the thread, and `None` means "keep all values owned by
+    # that thread". So each `thr*` is a small per-thread view:
+    #
+    #   thrA : (value_idx) -> address
+    #
+    # In other words, `thrA` is the fragment of A that this one thread will
+    # load, `thrB` is the fragment of B, and `thrC` is where this thread will
+    # store its results.
     thr_coord = (tidx, None)
     thrA = tidfrgA[thr_coord]
     thrB = tidfrgB[thr_coord]
     thrC = tidfrgC[thr_coord]
 
+    # Load the thread-local fragments, add them elementwise, then store the
+    # results back through the thread-local output view.
     thrC[None] = thrA.load() + thrB.load()
 
 
@@ -138,6 +196,12 @@ def tiled_elementwise_add(
     mC: cute.Tensor,
 ):
     coalesced_ldst_bytes = 16
+    # 16 bytes = 128 bits, so this asks CuTe to build the value layout around
+    # one 128-bit memory transaction per contiguous load/store lane.
+    #
+    # For fp16 elements (16 bits each), 16 bytes corresponds to 8 contiguous
+    # elements. That is why the byte-oriented value layout later gets recast
+    # into an element-oriented layout with 8 fp16 values along that dimension.
 
     assert all(t.element_type == mA.element_type for t in [mA, mB, mC])
     dtype = mA.element_type
@@ -178,31 +242,39 @@ def run_simple_kernel_demo():
     n = 1024
 
     # Keep values small so the float16 correctness check is easy to read.
+    # `a` repeats 0..15, while `b` is a constant 100 everywhere, so the
+    # result reads naturally as 100, 101, 102, ...
     a = (torch.arange(m * n, device="cuda", dtype=torch.int32) % 16).to(torch.float16)
-    b = (100 + (torch.arange(m * n, device="cuda", dtype=torch.int32) % 16)).to(torch.float16)
+    b = torch.full((m * n,), 100, device="cuda", dtype=torch.float16)
     a = a.reshape(m, n)
     b = b.reshape(m, n)
     c = torch.zeros_like(a)
 
+    # `assumed_align=16` means CuTe can treat these gmem pointers as 16-byte
+    # aligned, which matches the 128-bit load/store shape used above.
     mA = from_dlpack(a, assumed_align=16)
     mB = from_dlpack(b, assumed_align=16)
     mC = from_dlpack(c, assumed_align=16)
-
+    print(f"---- Starting shapes ----")
     print(f"mA shape: {mA.shape}, stride: {mA.stride}")
     print(f"mB shape: {mB.shape}, stride: {mB.stride}")
-    print(f"mC shape: {mC.shape}, stride: {mC.stride}")
+    print(f"mC shape: {mC.shape}, stride: {mC.stride}\n")
 
     expected = a + b
 
     tiled_add = cute.compile(tiled_elementwise_add, mA, mB, mC)
+    # call our compiled kernel
     tiled_add(mA, mB, mC)
+    # ensure results are ready with a cpu synch
     torch.cuda.synchronize()
 
+    print(f"\n---- Results: ----")
     print("input A, first row:", a[0, :8].tolist())
     print("input B, first row:", b[0, :8].tolist())
+    print(f"")
     print("expected, first row:", expected[0, :8].tolist())
     print("output C, first row:", c[0, :8].tolist())
-    print("matches torch:", torch.equal(c, expected))
+    print(f"\nmatches torch:", torch.equal(c, expected))
 
 
 def main():
