@@ -22,9 +22,13 @@ def show_layout_theory_jit():
     #   logical shape  : (2, 1024)
     #   physical stride: (1024, 1)  # 1 is fastest moving dimension..cols
     #
-    # So moving by +1 row jumps 1024 elements, while moving by +1 column
-    # jumps 1 element.
+    # So moving by +1 row jumps 1024 elements, 
+    # while moving by +1 column jumps 1 element.
 
+    # `make_layout(shape, stride=...)` creates the CuTe mapping from logical
+    # coordinates `(row, col)` to a linear memory offset. 
+    # Here it says:
+    # "this tensor has shape `(m, n)` and row-major stride `(n, 1)`".
     gmem = cute.make_layout((m, n), stride=(n, 1))
     print(f"Global layout: {gmem}")
     # -> (2,1024):(1024,1)
