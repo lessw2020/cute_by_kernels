@@ -9,36 +9,88 @@ from cutlass.cute.runtime import from_dlpack
 
 @cute.jit
 def show_layout_theory_jit():
+    m = 2
     n = 1024
-    block_size = 256
+    tile_m = 2
+    tile_n = 256
     block_idx_x = 2
 
-    gmem = cute.make_layout(n, stride=1)
+    # Start from a 2D row-major layout that matches the real tensor demo:
+    #
+    #   logical shape  : (2, 1024)
+    #   physical stride: (1024, 1)
+    #
+    # So moving by +1 row jumps 1024 elements, while moving by +1 column
+    # jumps 1 element.
+    gmem = cute.make_layout((m, n), stride=(n, 1))
     print(f"Global layout: {gmem}")
-    # -> 1024:1
+    # -> (2,1024):(1024,1)
+    #
+    # Read this as:
+    #   shape  = (rows, cols)   = (2, 1024)
+    #   stride = (row_stride, col_stride) = (1024, 1)
 
-    blocked = cute.zipped_divide(gmem, (block_size,))
+    # Tile the global layout into blocks of shape (2, 256).
+    #
+    # Because the full tensor is (2, 1024), this produces:
+    #   - one full tile in the row dimension
+    #   - four tiles in the column dimension
+    blocked = cute.zipped_divide(gmem, (tile_m, tile_n))
     print(f"After block divide: {blocked}")
-    # -> ((256),(4)):((1),(256))
+    # -> ((2,256),(1,4)):((1024,1),(0,256))
+    #
+    # Read this as:
+    #   first tuple  ((2,256), (1,4))
+    #     - (2,256) is the per-block tile shape
+    #     - (1,4)   tells us there are 1 x 4 such tiles in the full tensor
+    #
+    #   second tuple ((1024,1), (0,256))
+    #     - (1024,1) is the stride inside one block tile
+    #     - (0,256)  is the stride for moving between block tiles
+    #         * moving to the next tile row changes nothing (0), because there
+    #           is only one tile in the row dimension
+    #         * moving to the next tile column jumps by 256 elements
 
-    blk_layout, blk_offset = cute.slice_and_offset((None, block_idx_x), blocked)
-    print(f"Block {block_idx_x} layout: {blk_layout}")
-    print(f"Block {block_idx_x} base offset: {blk_offset}")
-    # -> ((256)):((1))
+    # Pick the third tile in the tile-column dimension: tile (0, 2).
+    # This corresponds to columns [512:768).
+    blk_layout, blk_offset = cute.slice_and_offset(((None, None), (0, block_idx_x)), blocked)
+    print(f"Block (0, {block_idx_x}) layout: {blk_layout}")
+    print(f"Block (0, {block_idx_x}) base offset: {blk_offset}")
+    # -> ((2,256)):((1024,1))
     # -> 512
+    #
+    # Read this as:
+    #   - the chosen block still has local shape (2, 256)
+    #   - inside that block, row-major addressing is unchanged
+    #   - the block starts at linear offset 512 in the original tensor
 
-    threaded = cute.zipped_divide(blk_layout, (1,))
+    # Now divide the chosen block into "one thread handles one full row slice
+    # of 256 contiguous elements". This is not the exact TV layout used in
+    # part 2, but it gives an easy-to-read stepping stone:
+    #
+    #   block    : (2, 256)
+    #   thread tile: (1, 256)
+    #
+    # so we get 2 thread-tiles total, one per row.
+    threaded = cute.zipped_divide(blk_layout, (1, 256))
     print(f"After thread divide: {threaded}")
-    # -> ((1),(256)):((0),(1))
+    # -> ((1,256),(2,1)):((0,1),(1024,0))
+    #
+    # Read this as:
+    #   - (1,256) is the work owned by one logical thread tile
+    #   - (2,1) means there are 2 such thread tiles inside the block
+    #   - the second tile stride (1024,0) shows how to move between
+    #     thread tiles:
+    #       * moving to the next thread-tile row jumps by 1024 elements
+    #       * moving in the tile-column dimension changes nothing because
+    #         there is only one tile there
 
-    local_idx = threaded((0, 0))
-    print(f"  thread 0 -> global offset {blk_offset + local_idx}")
-    local_idx = threaded((0, 1))
-    print(f"  thread 1 -> global offset {blk_offset + local_idx}")
-    local_idx = threaded((0, 2))
-    print(f"  thread 2 -> global offset {blk_offset + local_idx}")
-    local_idx = threaded((0, 3))
-    print(f"  thread 3 -> global offset {blk_offset + local_idx}")
+    # Show the first few column offsets in row 0 of the chosen block.
+    print("  first few addresses inside block row 0:")
+    print(f"    col 0 -> global offset {blk_offset + blk_layout((0, 0))}")
+    print(f"    col 1 -> global offset {blk_offset + blk_layout((0, 1))}")
+    print(f"    col 2 -> global offset {blk_offset + blk_layout((0, 2))}")
+    print(f"    col 3 -> global offset {blk_offset + blk_layout((0, 3))}")
 
 
 def show_layout_theory():
@@ -88,9 +140,12 @@ def tiled_elementwise_add(
     assert all(t.element_type == mA.element_type for t in [mA, mB, mC])
     dtype = mA.element_type
 
-    # Match the notebook's TV-layout construction.
-    thr_layout = cute.make_ordered_layout((4, 64), order=(1, 0))
-    val_layout = cute.make_ordered_layout((16, coalesced_ldst_bytes), order=(1, 0))
+    # A smaller TV layout that covers a (2, 256) tile:
+    # threads  : (1, 32)
+    # values   : (2, 16B) -> recast to (2, 8) for fp16
+    # combined : (2, 256)
+    thr_layout = cute.make_ordered_layout((1, 32), order=(1, 0))
+    val_layout = cute.make_ordered_layout((2, coalesced_ldst_bytes), order=(1, 0))
     val_layout = cute.recast_layout(dtype.width, 8, val_layout)
     tiler_mn, tv_layout = cute.make_layout_tv(thr_layout, val_layout)
 
@@ -115,10 +170,10 @@ def run_simple_kernel_demo():
         print("CUDA is not available, so the real tensor demo is skipped.")
         return
 
-    # This TV layout covers one exact (64, 512) tile, so we pick that shape
-    # to avoid boundary predicates in the minimal example.
-    m = 64
-    n = 512
+    # Use a small real tensor that lines up with four (2, 256) CuTe tiles.
+    # The physical torch stride stays non-overlapping row-major: (1024, 1).
+    m = 2
+    n = 1024
 
     # Keep values small so the float16 correctness check is easy to read.
     a = (torch.arange(m * n, device="cuda", dtype=torch.int32) % 16).to(torch.float16)
