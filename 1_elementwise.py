@@ -210,15 +210,30 @@ def tiled_elementwise_add(
     assert all(t.element_type == mA.element_type for t in [mA, mB, mC])
     dtype = mA.element_type
 
-    # A smaller TV layout that covers a (2, 256) tile:
-    # threads  : (1, 32)
-    # values   : (2, 16B) -> recast to (2, 8) for fp16
-    # combined : (2, 256)
+    # Build a thread-value (TV) layout in two pieces:
+    #
+    #   - `thr_layout` says how many logical threads participate in the tile
+    #   - `val_layout` says how much work one thread does
+    #
+    # Here:
+    #   threads  : (1, 32)
+    #   values   : (2, 16B) -> recast to (2, 8) for fp16
+    #
+    # So after the recast, each of the 32 threads owns a `(2, 8)` fragment,
+    # and together they cover a full `(2, 256)` CTA tile.
     thr_layout = cute.make_ordered_layout((1, 32), order=(1, 0))
     val_layout = cute.make_ordered_layout((2, coalesced_ldst_bytes), order=(1, 0))
     val_layout = cute.recast_layout(dtype.width, 8, val_layout)
+
+    # `make_layout_tv` combines those two ideas:
+    #   - `tiler_mn` is the overall tile shape this CTA will cover: `(2, 256)`
+    #   - `tv_layout` is the mapping from `(thread_idx, value_idx)` to coordinates
+    #     inside that tile
     tiler_mn, tv_layout = cute.make_layout_tv(thr_layout, val_layout)
 
+    # `zipped_divide` then cuts each whole tensor into tiles of shape `tiler_mn`.
+    # So `gA`, `gB`, and `gC` become "tensor-of-tiles" views, where one tile is
+    # exactly the work that one CTA will process.
     gA = cute.zipped_divide(mA, tiler_mn)
     gB = cute.zipped_divide(mB, tiler_mn)
     gC = cute.zipped_divide(mC, tiler_mn)

@@ -103,6 +103,11 @@ def inspect_blackwell_first_gemm_kernel(
 
         # These lines mirror the real tutorial kernel exactly: first cut out the
         # CTA tile each block owns, then repartition that tile for MMA.
+        #
+        # `proj` tells `local_tile` which GEMM axes this tensor actually uses:
+        #   A uses (M, K), so ignore N      -> proj=(1, None, 1)
+        #   B uses (N, K), so ignore M      -> proj=(None, 1, 1)
+        #   C uses (M, N), so ignore K      -> proj=(1, 1, None)
         gA = cute.local_tile(a_tma_tensor, mma_tiler_mnk, mma_coord_mnk, proj=(1, None, 1))
         gB = cute.local_tile(b_tma_tensor, mma_tiler_mnk, mma_coord_mnk, proj=(None, 1, 1))
         gC = cute.local_tile(mC_mn, mma_tiler_mnk, mma_coord_mnk, proj=(1, 1, None))
