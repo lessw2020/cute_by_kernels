@@ -1,6 +1,7 @@
 import os
 import subprocess
 import sys
+import time
 
 import torch
 import cutlass
@@ -59,6 +60,12 @@ def show_warp_handling_theory_jit():
     #   - mode 0 is now (lane, warp)
     #   - mode 1 is the per-thread iteration
     #   - warp structure is explicit in the layout, not reconstructed by hand
+    #   - stride (1, 32) inside mode 0 means:
+    #       * moving by +1 lane advances by 1 element
+    #       * moving by +1 warp advances by 32 elements
+    #   - stride 128 for mode 1 means:
+    #       * moving to the next iteration jumps by 128 elements
+    #         because one full CTA worth of threads has been skipped
     print("")
 
     lane_id = 5
@@ -158,9 +165,17 @@ def run_warp_handling_demo():
     mLane = from_dlpack(lane_out, assumed_align=16)
     mIter = from_dlpack(iter_out, assumed_align=16)
 
+    print("Compiling kernel with cute.compile ...")
+    compile_start = time.time()
     kernel = cute.compile(run_warp_handling_kernel, mWarp, mLane, mIter)
+    print(f"Compile finished in {time.time() - compile_start:.2f}s")
+
+    print("Launching kernel ...")
+    launch_start = time.time()
     kernel(mWarp, mLane, mIter)
     torch.cuda.synchronize()
+    print(f"Kernel run finished in {time.time() - launch_start:.2f}s")
+    print("Preparing readable output and verification ...")
 
     # Build the same expected ownership on the CPU so we can verify it.
     expected_warp = torch.empty_like(warp_out)
@@ -174,12 +189,22 @@ def run_warp_handling_demo():
                 expected_lane[offset] = lane
                 expected_iter[offset] = i
 
-    print("Warp ownership, iter 0 chunk [0:128]:")
-    print(warp_out[:128].cpu().tolist())
+    warp_cpu = warp_out.cpu()
+    lane_cpu = lane_out.cpu()
+    iter_cpu = iter_out.cpu()
+    expected_warp_cpu = expected_warp.cpu()
+    expected_lane_cpu = expected_lane.cpu()
+    expected_iter_cpu = expected_iter.cpu()
+
+    print("Warp ownership, iter 0 in warp-sized chunks:")
+    print("  offsets [0:32]:", warp_cpu[0:32].tolist())
+    print("  offsets [32:64]:", warp_cpu[32:64].tolist())
+    print("  offsets [64:96]:", warp_cpu[64:96].tolist())
+    print("  offsets [96:128]:", warp_cpu[96:128].tolist())
     print("")
 
     print("Lane ownership inside warp 2, iter 0 chunk [64:96]:")
-    print(lane_out[64:96].cpu().tolist())
+    print(lane_cpu[64:96].tolist())
     print("")
 
     print("One lane across all iterations:")
@@ -193,15 +218,15 @@ def run_warp_handling_demo():
     print(
         "  recorded iters:",
         [
-            int(iter_out[5 + 2 * WARP_SIZE + i * N_THR].item())
+            int(iter_cpu[5 + 2 * WARP_SIZE + i * N_THR].item())
             for i in range(ELEMS_PER_THR)
         ],
     )
     print("")
 
-    print("matches expected warp ids:", torch.equal(warp_out.cpu(), expected_warp.cpu()))
-    print("matches expected lane ids:", torch.equal(lane_out.cpu(), expected_lane.cpu()))
-    print("matches expected iter ids:", torch.equal(iter_out.cpu(), expected_iter.cpu()))
+    print("matches expected warp ids:", torch.equal(warp_cpu, expected_warp_cpu))
+    print("matches expected lane ids:", torch.equal(lane_cpu, expected_lane_cpu))
+    print("matches expected iter ids:", torch.equal(iter_cpu, expected_iter_cpu))
 
 
 def main():
