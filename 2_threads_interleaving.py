@@ -33,6 +33,7 @@ def show_interleaving_theory_jit():
     #   - there are 64 such tiles
     #   - inside one thread's tile, stride is 1
     #   - moving to the next thread's tile jumps by 4
+    #   - offset formula: offset = elem_in_thread + 4 * which_thread
     #
     # So thread 0 owns [0,1,2,3], thread 1 owns [4,5,6,7], etc.
     print(f"  thr 0, elem 0 -> offset {contiguous((0, 0))}")
@@ -54,6 +55,7 @@ def show_interleaving_theory_jit():
     #   - the second mode is which iteration that thread is handling
     #   - inside one iteration, neighboring threads are 1 apart
     #   - moving to the next iteration for the same thread jumps by 64
+    #   - offset formula: offset = which_thread + 64 * which_iteration
     #
     # So thread 0 owns [0,64,128,192], thread 1 owns [1,65,129,193], etc.
     print(f"  thr 0, iter 0 -> offset {interleaved((0, 0))}")
@@ -68,7 +70,10 @@ def show_interleaving_theory_jit():
     print("\nWhy interleaving helps")
     print("  contiguous, iter 0 across threads: 0, 4, 8, 12, ...")
     print("  interleaved, iter 0 across threads: 0, 1, 2, 3, ...")
-    print("  interleaved keeps threads in the same iteration on consecutive addresses.")
+    print("  interleaving is better if each thread issues one scalar load per iteration,")
+    print("  because neighboring threads touch neighboring addresses in that same iteration.")
+    print("  lesson 1 goes a step further: each thread gets a contiguous vector chunk,")
+    print("  while neighboring threads still cover neighboring chunks for 128-bit accesses.")
 
 
 def show_interleaving_theory():
