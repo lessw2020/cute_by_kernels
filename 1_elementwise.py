@@ -229,6 +229,8 @@ def tiled_elementwise_add(
     #   - `tiler_mn` is the overall tile shape this CTA will cover: `(2, 256)`
     #   - `tv_layout` is the mapping from `(thread_idx, value_idx)` to coordinates
     #     inside that tile
+    # tiler_mn = overall tile shape of this CTA
+    # tv_layout = which part of that tile does each thread and values it owns map to
     tiler_mn, tv_layout = cute.make_layout_tv(thr_layout, val_layout)
 
     # `zipped_divide` then cuts each whole tensor into tiles of shape `tiler_mn`.
