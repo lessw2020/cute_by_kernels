@@ -21,6 +21,22 @@ NUM_STAGES = 1
 
 @cute.struct
 class SharedStorage:
+    # This is the little block of CTA-shared bookkeeping that lives in SMEM.
+    #
+    # TMA copies are asynchronous: one thread can issue the GMEM -> SMEM copy,
+    # and other threads need a safe way to know when that staged tile is ready.
+    #
+    # `mbar_array` holds the memory barriers used by the pipeline. For each
+    # stage, CuTe keeps barrier state in shared memory so the producer side
+    # (issuing TMA) and the consumer side (reading the staged tile) can
+    # synchronize correctly.
+    #
+    # The `* 2` here is about storage size, not "one for producer and one for
+    # consumer": one mbarrier object takes 16 bytes, which is 2 x `Int64`
+    # entries in shared memory.
+    #
+    # With `NUM_STAGES = 1`, this lesson only needs one stage's worth of
+    # barriers, but the array is still written in the general staged form.
     mbar_array: cute.struct.MemRange[cutlass.Int64, NUM_STAGES * 2]
 
 
@@ -111,6 +127,13 @@ def show_tma_theory():
 
 @cute.kernel
 def tma_roundtrip_kernel(
+    # A `CopyAtom` is the smallest "copy recipe" object in CuTe:
+    # it packages up which hardware copy instruction to use plus the layout/
+    # tiling information needed to apply that instruction to this tensor tile.
+    #
+    # Here:
+    #   - `tma_load_atom` means "copy one tile from GMEM to SMEM with TMA"
+    #   - `tma_store_atom` means "copy one tile from SMEM back to GMEM with TMA"
     tma_load_atom: cute.CopyAtom,
     tma_load_tensor: cute.Tensor,
     tma_store_atom: cute.CopyAtom,
@@ -138,9 +161,21 @@ def tma_roundtrip_kernel(
     tma_pipeline = pipeline.PipelineTmaAsync.create(
         barrier_storage=storage.mbar_array.data_ptr(),
         num_stages=NUM_STAGES,
+        # One thread plays the "producer" role: it issues the TMA transaction.
+        # In larger kernels this could be a bigger cooperative group, but for
+        # this lesson a single thread is enough.
         producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 1),
+        # One thread also plays the "consumer" role: it waits until the staged
+        # tile is ready before allowing the lesson to continue.
         consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 1),
+        # `tx_count` is the number of bytes that one TMA transfer will move.
+        # Here that is:
+        #   bytes per element * elements in one 16x16 tile
+        # = (dtype.width // 8) * BLK_M * BLK_N
         tx_count=(dtype.width // 8) * BLK_M * BLK_N,
+        # `cta_layout_vmnk` describes the CTA cluster layout seen by the
+        # pipeline. `(1,1,1,1)` means this lesson uses the simplest case:
+        # one CTA, no multicast, no extra cluster structure to reason about.
         cta_layout_vmnk=cute.make_layout((1, 1, 1, 1)),
     )
 
@@ -171,6 +206,16 @@ def tma_roundtrip_kernel(
         # ------------------------------------------------------------------
         tma_pipeline.producer_acquire(producer_state)
 
+        # `tma_partition(...)` specializes the generic copy atom to this
+        # particular tile instance.
+        #
+        # It returns matching source/destination pieces:
+        #   - `g_load_part`: the GMEM tile view this TMA load should read
+        #   - `s_load_part`: the SMEM tile view this TMA load should fill
+        #
+        # So after this step, `cute.copy(tma_load_atom, ...)` is no longer
+        # "copy some generic tile", but "copy this exact GMEM tile into this
+        # exact SMEM tile".
         s_load_part, g_load_part = cpasync.tma_partition(
             tma_load_atom,
             0,
@@ -197,6 +242,9 @@ def tma_roundtrip_kernel(
         # used by the outgoing bulk store.
         cute.arch.fence_proxy("async.shared", space="cta")
 
+        # Same idea for the store atom: partition the generic SMEM -> GMEM
+        # recipe down to the specific staged tile in SMEM and the specific
+        # destination tile in GMEM for this CTA.
         s_store_part, g_store_part = cpasync.tma_partition(
             tma_store_atom,
             0,
@@ -222,6 +270,10 @@ def tma_roundtrip(
     # Build the real TMA descriptors:
     #   - one for loading a GMEM tile into a same-shaped SMEM tile
     #   - one for storing that SMEM tile back out to GMEM
+    #
+    # `make_tiled_tma_atom(...)` returns:
+    #   - a `CopyAtom`, which is the copy instruction/configuration object
+    #   - a tensor view whose coordinates match what that TMA copy expects
     tma_load_atom, tma_load_tensor = cpasync.make_tiled_tma_atom(
         cpasync.CopyBulkTensorTileG2SOp(),
         mA,
