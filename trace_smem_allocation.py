@@ -102,6 +102,7 @@ def trace_smem_kernel(
         cute.printf("B trace SMEM layout       = {}", sB_trace.layout)
         cute.printf("Read one-stage SMEM as: the same logical tile, but with K factored as 16 x 4")
         cute.printf("For A: ((128,16),1,4):((64,1),0,16) is roughly offset = m*64 + k_inner + k_outer*16")
+        cute.printf("The middle `1` is just a singleton structural mode; it is not the row mode")
 
         # Copy just the first row through the plain SMEM mirrors. This still
         # demonstrates the allocation and staging story, but keeps the trace
