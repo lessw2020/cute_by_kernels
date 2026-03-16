@@ -126,12 +126,26 @@ def inspect_blackwell_first_gemm_kernel(
             swizzle=b_smem_layout.inner,
         )
 
+        # `thr_mma` is one thread's view of the tiled MMA object.
+        # We use slice 0 here just to inspect the symbol shapes in a stable way.
         thr_mma = tiled_mma.get_slice(0)
+
+        # `partition_A/B/C` does not move data. It re-expresses the CTA tiles
+        # `gA/gB/gC` in the coordinate system that the MMA engine expects.
+        # So `tCg*` still refer to the CTA's GMEM tiles, but now with
+        # MMA-friendly indexing.
         tCgA = thr_mma.partition_A(gA)
         tCgB = thr_mma.partition_B(gB)
         tCgC = thr_mma.partition_C(gC)
+
+        # `make_fragment_A/B` builds the operand fragment views that MMA will
+        # read from staged SMEM. These are the "register-side" shapes that the
+        # later `cute.gemm(...)` loop indexes as `(None, None, k_block, stage)`.
         tCrA = tiled_mma.make_fragment_A(sA)
         tCrB = tiled_mma.make_fragment_B(sB)
+
+        # The accumulator fragment is shaped like one CTA tile of C, but in the
+        # MMA engine's preferred fragment coordinates rather than plain `(m, n)`.
         acc_shape = tiled_mma.partition_shape_C(mma_tiler_mnk[:2])
         tCtAcc = tiled_mma.make_fragment_C(acc_shape)
 
